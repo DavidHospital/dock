@@ -1,9 +1,9 @@
-use std::ffi::{CStr, CString, c_void};
+use std::ffi::{CStr, c_void};
 
 use anyhow::{Context, anyhow};
 use ash::{
     Entry, Instance,
-    ext::{debug_utils, queue_family_foreign},
+    ext::debug_utils,
     khr::{surface, swapchain, wayland_surface},
     prelude::VkResult,
     vk::{self},
@@ -26,12 +26,33 @@ pub struct Vk {
     graphics_queue: vk::Queue,
     present_queue: Option<vk::Queue>,
     queue_families: QueueFamilies,
+    device_details: SurfaceKHRDetails,
     swap_chain: Option<(swapchain::Device, vk::SwapchainKHR)>,
+    render_pass: Option<vk::RenderPass>,
+    vertex_module: Option<vk::ShaderModule>,
+    frag_module: Option<vk::ShaderModule>,
+    pipeline_layout: Option<vk::PipelineLayout>,
+    pipeline: Option<vk::Pipeline>,
 }
 
 impl Drop for Vk {
     fn drop(&mut self) {
         unsafe {
+            if let Some(pipeline) = self.pipeline.take() {
+                self.device.destroy_pipeline(pipeline, None);
+            }
+            if let Some(pipeline_layout) = self.pipeline_layout.take() {
+                self.device.destroy_pipeline_layout(pipeline_layout, None);
+            }
+            if let Some(render_pass) = self.render_pass.take() {
+                self.device.destroy_render_pass(render_pass, None);
+            }
+            if let Some(module) = self.vertex_module.take() {
+                self.device.destroy_shader_module(module, None);
+            }
+            if let Some(module) = self.frag_module.take() {
+                self.device.destroy_shader_module(module, None);
+            }
             if let Some((device, swap_chain)) = self.swap_chain.take() {
                 device.destroy_swapchain(swap_chain, None);
             }
@@ -129,6 +150,8 @@ impl Vk {
             let present_queue = queue_families
                 .present_family
                 .map(|present_family| device.get_device_queue(present_family, 0));
+            let device_details =
+                SurfaceKHRDetails::new(&instance_khr, physical_device, wl_surface)?;
 
             Ok(Self {
                 entry,
@@ -143,30 +166,34 @@ impl Vk {
                 graphics_queue,
                 present_queue,
                 queue_families,
+                device_details,
                 swap_chain: None,
+                render_pass: None,
+                pipeline_layout: None,
+                pipeline: None,
+                vertex_module: None,
+                frag_module: None,
             })
         }
     }
 
-    pub fn init_swap_chain(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
-        let device_details =
-            SurfaceKHRDetails::new(&self.instance_khr, self.physical_device, self.wl_surface)?;
-        let surface_format = device_details.choose_surface_format()?;
+    fn init_swap_chain(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
+        let surface_format = self.device_details.choose_surface_format()?;
         let queue_family_indices = self.queue_families.incides();
 
         let sc_create_info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.wl_surface)
-            .min_image_count(device_details.surface_caps.min_image_count)
+            .min_image_count(self.device_details.surface_caps.min_image_count)
             .image_format(surface_format.format)
             .image_color_space(surface_format.color_space)
-            .image_extent(device_details.choose_extent(width, height))
+            .image_extent(self.device_details.choose_extent(width, height))
             .image_array_layers(1)
             .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
             .image_sharing_mode(self.queue_families.sharing_mode())
             .queue_family_indices(&queue_family_indices)
-            .pre_transform(device_details.surface_caps.current_transform)
+            .pre_transform(self.device_details.surface_caps.current_transform)
             .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
-            .present_mode(device_details.choose_present_mode())
+            .present_mode(self.device_details.choose_present_mode())
             .clipped(true)
             .old_swapchain(vk::SwapchainKHR::null());
 
@@ -183,59 +210,131 @@ impl Vk {
 
         Ok(())
     }
-}
 
-pub struct DockPipeline {
-    pipeline: vk::Pipeline,
-}
+    pub fn init_pipeline(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
+        self.init_swap_chain(width, height)?;
 
-impl DockPipeline {
-    pub fn new(ctx: &Vk) -> anyhow::Result<Self> {
-        let layout = unsafe {
-            ctx.device.create_pipeline_layout(
-                &vk::PipelineLayoutCreateInfo::default().set_layouts(&[]),
-                None,
-            )?
-        };
+        if let Some(pipeline) = self.pipeline.take() {
+            unsafe { self.device.destroy_pipeline(pipeline, None) };
+        }
+
+        if let Some(pipeline_layout) = self.pipeline_layout.take() {
+            unsafe { self.device.destroy_pipeline_layout(pipeline_layout, None) };
+        }
+
+        if let Some(render_pass) = self.render_pass.take() {
+            unsafe {
+                self.device.destroy_render_pass(render_pass, None);
+            }
+        }
+
+        if let Some(module) = self.vertex_module.take() {
+            unsafe { self.device.destroy_shader_module(module, None) };
+        }
+
+        if let Some(module) = self.frag_module.take() {
+            unsafe { self.device.destroy_shader_module(module, None) };
+        }
 
         let shader_module = ShaderModule::new(include_str!("shader.wgsl"))?;
 
-        let vs_name = CString::new("vs_main")?;
-        let fs_name = CString::new("fs_main")?;
+        let vertex_module = shader_module.vertex(&self.device)?;
+        let frag_module = shader_module.fragment(&self.device)?;
+
+        let color_attachments = [vk::AttachmentDescription::default()
+            .format(self.device_details.choose_surface_format()?.format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+
+        let color_attachment_refs = [vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+
+        let subpasses = [vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_attachment_refs)];
+
+        let render_pass_create_info = vk::RenderPassCreateInfo::default()
+            .attachments(&color_attachments)
+            .subpasses(&subpasses);
+
+        let render_pass = unsafe {
+            self.device
+                .create_render_pass(&render_pass_create_info, None)?
+        };
 
         let stages = [
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
-                .module(shader_module.vertex(ctx)?)
-                .name(&vs_name),
+                .name(&c"vs_main")
+                .module(vertex_module),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
-                .module(shader_module.fragment(ctx)?)
-                .name(&fs_name),
+                .name(&c"fs_main")
+                .module(frag_module),
         ];
         let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default();
-        let rasteration_state = vk::PipelineRasterizationStateCreateInfo::default();
-
-        let render_pass_create_info = vk::RenderPassCreateInfo::default();
-        let render_pass = unsafe {
-            ctx.device
-                .create_render_pass(&render_pass_create_info, None)
-        }?;
-
-        let create_info = vk::GraphicsPipelineCreateInfo::default()
-            .layout(layout)
+        let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewports = [vk::Viewport {
+            x: 0.,
+            y: 0.,
+            width: width as f32,
+            height: height as f32,
+            min_depth: 0.,
+            max_depth: 1.,
+        }];
+        let scissors = [vk::Rect2D::default()
+            .offset(vk::Offset2D { x: 0, y: 0 })
+            .extent(self.device_details.choose_extent(width, height))];
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewports(&viewports)
+            .scissors(&scissors);
+        let rasterization_state = vk::PipelineRasterizationStateCreateInfo::default()
+            .cull_mode(vk::CullModeFlags::BACK)
+            .polygon_mode(vk::PolygonMode::FILL)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample_state = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(vk::ColorComponentFlags::RGBA)
+            .blend_enable(false)];
+        let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
+            .logic_op_enable(false)
+            .attachments(&color_blend_attachments);
+        let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo::default();
+        let pipeline_layout = unsafe {
+            self.device
+                .create_pipeline_layout(&pipeline_layout_create_info, None)?
+        };
+        let pipeline_create_infos = [vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
             .vertex_input_state(&vertex_input_state)
-            .rasterization_state(&rasteration_state)
-            .render_pass(render_pass);
-
+            .input_assembly_state(&input_assembly_state)
+            .viewport_state(&viewport_state)
+            .multisample_state(&multisample_state)
+            .rasterization_state(&rasterization_state)
+            .color_blend_state(&color_blend_state)
+            .render_pass(render_pass)
+            .subpass(0)];
         let pipeline = unsafe {
-            ctx.device
-                .create_graphics_pipelines(vk::PipelineCache::null(), &[create_info], None)
-                .map_err(|(_, result)| result)?[0]
+            self.device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &pipeline_create_infos, None)
+                .map_err(|e| e.1)?[0]
         };
 
-        Ok(Self { pipeline })
+        self.pipeline = Some(pipeline);
+        self.pipeline_layout = Some(pipeline_layout);
+        self.vertex_module = Some(vertex_module);
+        self.frag_module = Some(frag_module);
+
+        Ok(())
     }
 }
 
@@ -261,7 +360,7 @@ impl ShaderModule {
         })
     }
 
-    fn vertex(&self, ctx: &Vk) -> anyhow::Result<vk::ShaderModule> {
+    fn vertex(&self, device: &ash::Device) -> anyhow::Result<vk::ShaderModule> {
         let code = naga::back::spv::write_vec(
             &self.module,
             &self.module_info,
@@ -273,12 +372,12 @@ impl ShaderModule {
         )?;
         let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
 
-        let shader_module = unsafe { ctx.device.create_shader_module(&create_info, None)? };
+        let shader_module = unsafe { device.create_shader_module(&create_info, None)? };
 
         Ok(shader_module)
     }
 
-    fn fragment(&self, ctx: &Vk) -> anyhow::Result<vk::ShaderModule> {
+    fn fragment(&self, device: &ash::Device) -> anyhow::Result<vk::ShaderModule> {
         let code = naga::back::spv::write_vec(
             &self.module,
             &self.module_info,
@@ -290,7 +389,7 @@ impl ShaderModule {
         )?;
         let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
 
-        let shader_module = unsafe { ctx.device.create_shader_module(&create_info, None)? };
+        let shader_module = unsafe { device.create_shader_module(&create_info, None)? };
 
         Ok(shader_module)
     }

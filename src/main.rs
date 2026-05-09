@@ -136,7 +136,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
             } => {
                 proxy.ack_configure(serial);
 
-                state.ctx.init_swap_chain(width, height).unwrap();
+                state.ctx.init_pipeline(width, height).unwrap();
 
                 let buffers = create_buffers(&state.globals.shm, width, height, qhandle).unwrap();
                 state.surface.attach(Some(&buffers[0]), 0, 0);
