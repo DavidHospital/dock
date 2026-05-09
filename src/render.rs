@@ -237,13 +237,13 @@ impl Vk {
         }
 
         let vert_code = include_bytes!("shader.vert.spv");
-        let vert_create_info = vk::ShaderModuleCreateInfo::default()
-            .code(bytemuck::cast_slice(vert_code));
+        let vert_create_info =
+            vk::ShaderModuleCreateInfo::default().code(bytemuck::cast_slice(vert_code));
         let vert_module = unsafe { self.device.create_shader_module(&vert_create_info, None)? };
 
         let frag_code = include_bytes!("shader.frag.spv");
-        let frag_create_info = vk::ShaderModuleCreateInfo::default()
-            .code(bytemuck::cast_slice(frag_code));
+        let frag_create_info =
+            vk::ShaderModuleCreateInfo::default().code(bytemuck::cast_slice(frag_code));
         let frag_module = unsafe { self.device.create_shader_module(&frag_create_info, None)? };
 
         let color_attachments = [vk::AttachmentDescription::default()

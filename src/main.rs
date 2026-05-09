@@ -3,12 +3,19 @@ mod render;
 use std::os::fd::{AsRawFd, BorrowedFd};
 
 use memmap2::MmapMut;
-use wayland_client::{
-    Connection, QueueHandle, delegate_noop, protocol::{
-        wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_display::WlDisplay, wl_registry, wl_shm::{self, WlShm}, wl_shm_pool::WlShmPool, wl_surface::WlSurface
-    }
-};
 use wayland_client::Dispatch;
+use wayland_client::{
+    Connection, QueueHandle, delegate_noop,
+    protocol::{
+        wl_buffer::WlBuffer,
+        wl_compositor::WlCompositor,
+        wl_display::WlDisplay,
+        wl_registry,
+        wl_shm::{self, WlShm},
+        wl_shm_pool::WlShmPool,
+        wl_surface::WlSurface,
+    },
+};
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
@@ -215,7 +222,7 @@ fn create_buffers<S: Dispatch<WlShmPool, ()> + Dispatch<WlBuffer, ()> + 'static>
             data[word * 4 + 2] = 0x19;
             data[word * 4 + 3] = 165;
         }
-        
+
         shm.create_pool(
             BorrowedFd::borrow_raw(owned_fd.as_raw_fd()),
             size as i32 * 2,
