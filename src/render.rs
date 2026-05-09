@@ -64,6 +64,7 @@ impl Drop for RenderPipeline {
     }
 }
 
+#[allow(unused)]
 pub struct Vk {
     entry: Entry,
     instance: Instance,
@@ -664,6 +665,7 @@ impl QueueFamilies {
     }
 }
 
+#[allow(unused)]
 struct SurfaceKHRDetails {
     surface_caps: vk::SurfaceCapabilitiesKHR,
     surface_formats: Vec<vk::SurfaceFormatKHR>,
