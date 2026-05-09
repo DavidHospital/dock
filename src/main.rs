@@ -46,13 +46,11 @@ impl State {
         surface.commit();
 
         let ctx = Vk::new(display, &surface).unwrap();
-        // let pipeline = DockPipeline::new(&ctx).unwrap();
 
         Self {
             globals,
             surface,
             ctx,
-            // pipeline,
         }
     }
 }
