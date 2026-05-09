@@ -5,13 +5,8 @@ use wayland_client::protocol::wl_callback;
 use wayland_client::{
     Connection, QueueHandle, delegate_noop,
     protocol::{
-        wl_buffer::WlBuffer,
-        wl_compositor::WlCompositor,
-        wl_display::WlDisplay,
-        wl_registry,
-        wl_shm::{self, WlShm},
-        wl_shm_pool::WlShmPool,
-        wl_surface::WlSurface,
+        wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_display::WlDisplay, wl_registry,
+        wl_shm::WlShm, wl_shm_pool::WlShmPool, wl_surface::WlSurface,
     },
 };
 use wayland_protocols_wlr::layer_shell::v1::client::{
@@ -22,7 +17,6 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
 use crate::render::Vk;
 
 struct State {
-    globals: Globals,
     surface: WlSurface,
     ctx: Vk,
 }
@@ -45,23 +39,17 @@ impl State {
 
         let ctx = Vk::new(display, &surface).unwrap();
 
-        Self {
-            globals,
-            surface,
-            ctx,
-        }
+        Self { surface, ctx }
     }
 }
 
 struct Globals {
     compositor: WlCompositor,
-    shm: WlShm,
     layer_shell: ZwlrLayerShellV1,
 }
 
 struct Bootstrap {
     compositor: Option<WlCompositor>,
-    shm: Option<WlShm>,
     layer_shell: Option<ZwlrLayerShellV1>,
 }
 
@@ -69,15 +57,13 @@ impl TryFrom<Bootstrap> for Globals {
     type Error = Bootstrap;
 
     fn try_from(bootstrap: Bootstrap) -> Result<Self, Self::Error> {
-        match (bootstrap.compositor, bootstrap.shm, bootstrap.layer_shell) {
-            (Some(compositor), Some(shm), Some(layer_shell)) => Ok(Globals {
+        match (bootstrap.compositor, bootstrap.layer_shell) {
+            (Some(compositor), Some(layer_shell)) => Ok(Globals {
                 compositor,
-                shm,
                 layer_shell,
             }),
-            (compositor, shm, layer_shell) => Err(Bootstrap {
+            (compositor, layer_shell) => Err(Bootstrap {
                 compositor,
-                shm,
                 layer_shell,
             }),
         }
@@ -105,10 +91,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Bootstrap {
                         registry.bind::<WlCompositor, _, _>(name, version, qhandle, ());
                     state.compositor = Some(compositor);
                 }
-                "wl_shm" => {
-                    let shm = registry.bind::<WlShm, _, _>(name, version, qhandle, ());
-                    state.shm = Some(shm);
-                }
                 "zwlr_layer_shell_v1" => {
                     let layer_shell =
                         registry.bind::<ZwlrLayerShellV1, _, _>(name, version, qhandle, ());
@@ -116,7 +98,6 @@ impl Dispatch<wl_registry::WlRegistry, ()> for Bootstrap {
                 }
                 _ => {}
             }
-            // println!("[{name}] {interface} [v{version}]");
         }
     }
 }
@@ -142,7 +123,6 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
                 state.ctx.draw_frame().unwrap();
 
                 state.surface.frame(qhandle, ());
-                println!("Configured");
             }
             _ => {}
         }
@@ -158,7 +138,6 @@ impl Dispatch<wl_callback::WlCallback, ()> for State {
         _conn: &Connection,
         qhandle: &QueueHandle<Self>,
     ) {
-        println!("Frame");
         if let wl_callback::Event::Done { callback_data: _ } = event {
             state.ctx.draw_frame().unwrap();
 
@@ -188,7 +167,6 @@ fn main() -> anyhow::Result<()> {
 
     let mut bootstrap = Bootstrap {
         compositor: None,
-        shm: None,
         layer_shell: None,
     };
 

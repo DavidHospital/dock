@@ -486,6 +486,9 @@ impl Vk {
                 self.present_queue.unwrap_or(self.graphics_queue),
                 &present_info,
             )?;
+
+            self.device
+                .queue_wait_idle(self.present_queue.unwrap_or(self.graphics_queue))?;
         }
 
         Ok(())
