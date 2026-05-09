@@ -319,6 +319,7 @@ impl Vk {
                 .create_pipeline_layout(&pipeline_layout_create_info, None)?
         };
         let pipeline_create_infos = [vk::GraphicsPipelineCreateInfo::default()
+            .layout(pipeline_layout)
             .stages(&stages)
             .vertex_input_state(&vert_input_state)
             .input_assembly_state(&input_assembly_state)
