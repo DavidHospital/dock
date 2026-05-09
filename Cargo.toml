@@ -1,5 +1,5 @@
 [workspace]
-members = [
+members = ["bitpacker",
 	"dock"
 ]
 resolver = "3"
