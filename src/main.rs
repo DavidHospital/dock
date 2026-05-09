@@ -1,26 +1,30 @@
 mod protocol;
+mod render;
 
 use std::os::fd::{AsRawFd, BorrowedFd};
 
 use memmap2::MmapMut;
 use wayland_client::{
-    Connection, Dispatch, QueueHandle, delegate_noop,
-    protocol::{
-        wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_registry, wl_shm::{self, WlShm}, wl_shm_pool::WlShmPool, wl_surface::WlSurface
-    },
+    Connection, QueueHandle, delegate_noop, protocol::{
+        wl_buffer::WlBuffer, wl_compositor::WlCompositor, wl_display::WlDisplay, wl_registry, wl_shm::{self, WlShm}, wl_shm_pool::WlShmPool, wl_surface::WlSurface
+    }
 };
+use wayland_client::Dispatch;
 use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_shell_v1::{Layer, ZwlrLayerShellV1},
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
 
+use crate::render::Vk;
+
 struct State {
     globals: Globals,
     surface: WlSurface,
+    ctx: Vk,
 }
 
 impl State {
-    fn new(globals: Globals, qh: &QueueHandle<Self>) -> Self {
+    fn new(display: &WlDisplay, globals: Globals, qh: &QueueHandle<Self>) -> Self {
         let surface = globals.compositor.create_surface(qh, ());
         let layer_surface = globals.layer_shell.get_layer_surface(
             &surface,
@@ -35,9 +39,14 @@ impl State {
         layer_surface.set_size(0, 48);
         surface.commit();
 
+        let ctx = Vk::new(display, &surface).unwrap();
+        // let pipeline = DockPipeline::new(&ctx).unwrap();
+
         Self {
             globals,
             surface,
+            ctx,
+            // pipeline,
         }
     }
 }
@@ -127,6 +136,8 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
             } => {
                 proxy.ack_configure(serial);
 
+                state.ctx.init_swap_chain(width, height).unwrap();
+
                 let buffers = create_buffers(&state.globals.shm, width, height, qhandle).unwrap();
                 state.surface.attach(Some(&buffers[0]), 0, 0);
                 state.surface.damage(0, 0, i32::MAX, i32::MAX);
@@ -175,7 +186,7 @@ fn main() -> anyhow::Result<()> {
     let mut event_queue = connection.new_event_queue::<State>();
     let qh = event_queue.handle();
 
-    let mut state = State::new(globals, &qh);
+    let mut state = State::new(&display, globals, &qh);
 
     println!("Configured");
 

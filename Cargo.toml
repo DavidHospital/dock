@@ -5,9 +5,11 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
+ash = "0.38.0"
 memmap2 = "0.9.10"
+naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }
 rustix = "1.1.4"
-wayland-backend = "0.3.15"
+wayland-backend = { version = "0.3.15", features = ["client_system"] }
 wayland-client = "0.31.14"
 wayland-protocol = "0.2.0"
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
