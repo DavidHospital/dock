@@ -32,11 +32,20 @@ struct RenderPipeline {
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
+    image_available_sem: vk::Semaphore,
+    render_finished_sem: vk::Semaphore,
+    in_flight_fence: vk::Fence,
 }
 
 impl Drop for RenderPipeline {
     fn drop(&mut self) {
         unsafe {
+            let _ = self.device.reset_fences(&[self.in_flight_fence]);
+            self.device.destroy_fence(self.in_flight_fence, None);
+            self.device
+                .destroy_semaphore(self.render_finished_sem, None);
+            self.device
+                .destroy_semaphore(self.image_available_sem, None);
             self.device.destroy_command_pool(self.command_pool, None);
             for framebuffer in &self.framebuffers {
                 self.device.destroy_framebuffer(*framebuffer, None);
@@ -198,6 +207,10 @@ impl Vk {
 
     pub fn init_pipeline(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
         if let Some(render_pipeline) = self.render_pipeline.take() {
+            unsafe {
+                self.device.device_wait_idle()?;
+            }
+
             drop(render_pipeline);
         }
 
@@ -216,7 +229,7 @@ impl Vk {
             .image_sharing_mode(self.queue_families.sharing_mode())
             .queue_family_indices(&queue_family_indices)
             .pre_transform(self.device_details.surface_caps.current_transform)
-            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .composite_alpha(self.device_details.choose_composite_alpha_flag())
             .present_mode(self.device_details.choose_present_mode())
             .clipped(true)
             .old_swapchain(vk::SwapchainKHR::null());
@@ -250,13 +263,13 @@ impl Vk {
         }
 
         let vert_code = include_bytes!("shader.vert.spv");
-        let vert_create_info =
-            vk::ShaderModuleCreateInfo::default().code(bytemuck::cast_slice(vert_code));
+        let vert_code = bytes_to_spv(vert_code);
+        let vert_create_info = vk::ShaderModuleCreateInfo::default().code(&vert_code);
         let vert_module = unsafe { self.device.create_shader_module(&vert_create_info, None)? };
 
         let frag_code = include_bytes!("shader.frag.spv");
-        let frag_create_info =
-            vk::ShaderModuleCreateInfo::default().code(bytemuck::cast_slice(frag_code));
+        let frag_code = bytes_to_spv(frag_code);
+        let frag_create_info = vk::ShaderModuleCreateInfo::default().code(&frag_code);
         let frag_module = unsafe { self.device.create_shader_module(&frag_create_info, None)? };
 
         let color_attachments = [vk::AttachmentDescription::default()
@@ -322,10 +335,19 @@ impl Vk {
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let color_blend_attachments = [vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(vk::ColorComponentFlags::RGBA)
-            .blend_enable(false)];
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_COLOR)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ZERO)
+            .alpha_blend_op(vk::BlendOp::ADD)];
         let color_blend_state = vk::PipelineColorBlendStateCreateInfo::default()
             .logic_op_enable(false)
             .attachments(&color_blend_attachments);
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic_state =
+            vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
         let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo::default();
         let pipeline_layout = unsafe {
             self.device
@@ -340,6 +362,7 @@ impl Vk {
             .multisample_state(&multisample_state)
             .rasterization_state(&rasterization_state)
             .color_blend_state(&color_blend_state)
+            .dynamic_state(&dynamic_state)
             .render_pass(render_pass)
             .subpass(0)];
         let pipeline = unsafe {
@@ -365,7 +388,7 @@ impl Vk {
         }
 
         let command_pool_create_info = vk::CommandPoolCreateInfo::default()
-            .flags(vk::CommandPoolCreateFlags::TRANSIENT)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
             .queue_family_index(self.queue_families.graphics_family);
 
         let command_pool = unsafe {
@@ -383,6 +406,21 @@ impl Vk {
                 .allocate_command_buffers(&command_buffer_create_info)?
         };
 
+        let image_available_sem = unsafe {
+            self.device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
+        };
+        let render_finished_sem = unsafe {
+            self.device
+                .create_semaphore(&vk::SemaphoreCreateInfo::default(), None)?
+        };
+        let in_flight_fence = unsafe {
+            self.device.create_fence(
+                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                None,
+            )?
+        };
+
         self.render_pipeline = Some(RenderPipeline {
             device: self.device.clone(),
             swap_chain: (sc_device, swap_chain, image_views, extent),
@@ -394,7 +432,61 @@ impl Vk {
             command_pool: command_pool,
             command_buffers: command_buffers,
             render_pass,
+            image_available_sem,
+            render_finished_sem,
+            in_flight_fence,
         });
+
+        Ok(())
+    }
+
+    pub fn draw_frame(&self) -> anyhow::Result<()> {
+        let Some(rp) = self.render_pipeline.as_ref() else {
+            anyhow::bail!("Render pipeline not configured");
+        };
+
+        let (sc_device, swap_chain, _, _) = &rp.swap_chain;
+
+        unsafe {
+            self.device
+                .wait_for_fences(&[rp.in_flight_fence], true, u64::MAX)?;
+            self.device.reset_fences(&[rp.in_flight_fence])?;
+
+            let (image_index, _) = sc_device.acquire_next_image(
+                *swap_chain,
+                u64::MAX,
+                rp.image_available_sem,
+                vk::Fence::null(),
+            )?;
+
+            self.device.reset_command_buffer(
+                rp.command_buffers[0],
+                vk::CommandBufferResetFlags::empty(),
+            )?;
+            self.record_command_buffer(0, image_index as usize)?;
+
+            let wait_semaphores = [rp.image_available_sem];
+            let signal_semaphores = [rp.render_finished_sem];
+            let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
+            let submit_info = vk::SubmitInfo::default()
+                .wait_semaphores(&wait_semaphores)
+                .wait_dst_stage_mask(&wait_stages)
+                .command_buffers(&rp.command_buffers[..1])
+                .signal_semaphores(&signal_semaphores);
+            self.device
+                .queue_submit(self.graphics_queue, &[submit_info], rp.in_flight_fence)?;
+
+            let swapchains = [*swap_chain];
+            let image_indices = [image_index];
+            let present_info = vk::PresentInfoKHR::default()
+                .wait_semaphores(&signal_semaphores)
+                .swapchains(&swapchains)
+                .image_indices(&image_indices);
+            sc_device.queue_present(
+                self.present_queue.unwrap_or(self.graphics_queue),
+                &present_info,
+            )?;
+        }
 
         Ok(())
     }
@@ -619,4 +711,26 @@ impl SurfaceKHRDetails {
     fn choose_extent(&self, width: u32, height: u32) -> vk::Extent2D {
         vk::Extent2D { width, height }
     }
+
+    fn choose_composite_alpha_flag(&self) -> vk::CompositeAlphaFlagsKHR {
+        let mut flag = vk::CompositeAlphaFlagsKHR::empty();
+        flag |= self.surface_caps.supported_composite_alpha
+            & vk::CompositeAlphaFlagsKHR::PRE_MULTIPLIED;
+        if !flag.is_empty() {
+            return flag;
+        }
+        flag |= self.surface_caps.supported_composite_alpha & vk::CompositeAlphaFlagsKHR::INHERIT;
+        if !flag.is_empty() {
+            return flag;
+        }
+        return vk::CompositeAlphaFlagsKHR::OPAQUE;
+    }
+}
+
+fn bytes_to_spv(bytes: &[u8]) -> Vec<u32> {
+    assert!(bytes.len() % 4 == 0);
+    bytes
+        .chunks_exact(4)
+        .map(|c| u32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
 }

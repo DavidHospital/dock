@@ -13,9 +13,6 @@ panic = "abort"
 [dependencies]
 anyhow = "1.0.102"
 ash = "0.38.0"
-bytemuck = "1.25.0"
-memmap2 = "0.9.10"
-rustix = "1.1.4"
 wayland-backend = { version = "0.3.15", features = ["client_system"] }
 wayland-client = "0.31.14"
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }

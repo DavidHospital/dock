@@ -1,9 +1,7 @@
 mod render;
 
-use std::os::fd::{AsRawFd, BorrowedFd};
-
-use memmap2::MmapMut;
 use wayland_client::Dispatch;
+use wayland_client::protocol::wl_callback;
 use wayland_client::{
     Connection, QueueHandle, delegate_noop,
     protocol::{
@@ -141,13 +139,31 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
                 proxy.ack_configure(serial);
 
                 state.ctx.init_pipeline(width, height).unwrap();
+                state.ctx.draw_frame().unwrap();
 
-                let buffers = create_buffers(&state.globals.shm, width, height, qhandle).unwrap();
-                state.surface.attach(Some(&buffers[0]), 0, 0);
-                state.surface.damage(0, 0, i32::MAX, i32::MAX);
-                state.surface.commit();
+                state.surface.frame(qhandle, ());
+                println!("Configured");
             }
             _ => {}
+        }
+    }
+}
+
+impl Dispatch<wl_callback::WlCallback, ()> for State {
+    fn event(
+        state: &mut Self,
+        _proxy: &wl_callback::WlCallback,
+        event: <wl_callback::WlCallback as wayland_client::Proxy>::Event,
+        _data: &(),
+        _conn: &Connection,
+        qhandle: &QueueHandle<Self>,
+    ) {
+        println!("Frame");
+        if let wl_callback::Event::Done { callback_data: _ } = event {
+            state.ctx.draw_frame().unwrap();
+
+            state.surface.frame(qhandle, ());
+            state.surface.commit();
         }
     }
 }
@@ -192,64 +208,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut state = State::new(&display, globals, &qh);
 
-    println!("Configured");
-
     while event_queue.blocking_dispatch(&mut state).is_ok() {}
 
     Ok(())
-}
-
-fn create_buffers<S: Dispatch<WlShmPool, ()> + Dispatch<WlBuffer, ()> + 'static>(
-    shm: &WlShm,
-    width: u32,
-    height: u32,
-    qh: &QueueHandle<S>,
-) -> anyhow::Result<[WlBuffer; 2]> {
-    let stride = width * 4;
-    let size = stride * height;
-
-    let owned_fd = rustix::fs::memfd_create("dock", rustix::fs::MemfdFlags::empty())?;
-    rustix::fs::ftruncate(&owned_fd, size as u64)?;
-
-    let pool = unsafe {
-        let mut data = MmapMut::map_mut(&owned_fd)?;
-        for word in 0..data.len() / 4 {
-            // 0x192035
-            data[word * 4 + 0] = 0x35;
-            data[word * 4 + 1] = 0x20;
-            data[word * 4 + 2] = 0x19;
-            data[word * 4 + 3] = 165;
-        }
-
-        shm.create_pool(
-            BorrowedFd::borrow_raw(owned_fd.as_raw_fd()),
-            size as i32 * 2,
-            &qh,
-            (),
-        )
-    };
-
-    let b1 = pool.create_buffer(
-        0,
-        width as i32,
-        height as i32,
-        stride as i32,
-        wl_shm::Format::Argb8888,
-        qh,
-        (),
-    );
-
-    let b2 = pool.create_buffer(
-        size as i32,
-        width as i32,
-        height as i32,
-        stride as i32,
-        wl_shm::Format::Argb8888,
-        qh,
-        (),
-    );
-
-    pool.destroy();
-
-    Ok([b1, b2])
 }
