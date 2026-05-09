@@ -1,7 +1,8 @@
-[package]
-name = "dock"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = [
+	"dock"
+]
+resolver = "3"
 
 [profile.release]
 opt-level = "z"
@@ -9,15 +10,3 @@ lto = true
 strip = true
 codegen-units = 1
 panic = "abort"
-
-[dependencies]
-anyhow = "1.0.102"
-ash = "0.38.0"
-wayland-backend = { version = "0.3.15", features = ["client_system"] }
-wayland-client = "0.31.14"
-wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
-
-[build-dependencies]
-anyhow = "1.0.102"
-bytemuck = "1.25.0"
-naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }
