@@ -29,7 +29,7 @@ pub struct Vk {
     device_details: SurfaceKHRDetails,
     swap_chain: Option<(swapchain::Device, vk::SwapchainKHR)>,
     render_pass: Option<vk::RenderPass>,
-    vertex_module: Option<vk::ShaderModule>,
+    vert_module: Option<vk::ShaderModule>,
     frag_module: Option<vk::ShaderModule>,
     pipeline_layout: Option<vk::PipelineLayout>,
     pipeline: Option<vk::Pipeline>,
@@ -47,7 +47,7 @@ impl Drop for Vk {
             if let Some(render_pass) = self.render_pass.take() {
                 self.device.destroy_render_pass(render_pass, None);
             }
-            if let Some(module) = self.vertex_module.take() {
+            if let Some(module) = self.vert_module.take() {
                 self.device.destroy_shader_module(module, None);
             }
             if let Some(module) = self.frag_module.take() {
@@ -171,7 +171,7 @@ impl Vk {
                 render_pass: None,
                 pipeline_layout: None,
                 pipeline: None,
-                vertex_module: None,
+                vert_module: None,
                 frag_module: None,
             })
         }
@@ -228,7 +228,7 @@ impl Vk {
             }
         }
 
-        if let Some(module) = self.vertex_module.take() {
+        if let Some(module) = self.vert_module.take() {
             unsafe { self.device.destroy_shader_module(module, None) };
         }
 
@@ -236,10 +236,15 @@ impl Vk {
             unsafe { self.device.destroy_shader_module(module, None) };
         }
 
-        let shader_module = ShaderModule::new(include_str!("shader.wgsl"))?;
+        let vert_code = include_bytes!("shader.vert.spv");
+        let vert_create_info = vk::ShaderModuleCreateInfo::default()
+            .code(bytemuck::cast_slice(vert_code));
+        let vert_module = unsafe { self.device.create_shader_module(&vert_create_info, None)? };
 
-        let vertex_module = shader_module.vertex(&self.device)?;
-        let frag_module = shader_module.fragment(&self.device)?;
+        let frag_code = include_bytes!("shader.frag.spv");
+        let frag_create_info = vk::ShaderModuleCreateInfo::default()
+            .code(bytemuck::cast_slice(frag_code));
+        let frag_module = unsafe { self.device.create_shader_module(&frag_create_info, None)? };
 
         let color_attachments = [vk::AttachmentDescription::default()
             .format(self.device_details.choose_surface_format()?.format)
@@ -272,13 +277,13 @@ impl Vk {
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::VERTEX)
                 .name(&c"vs_main")
-                .module(vertex_module),
+                .module(vert_module),
             vk::PipelineShaderStageCreateInfo::default()
                 .stage(vk::ShaderStageFlags::FRAGMENT)
                 .name(&c"fs_main")
                 .module(frag_module),
         ];
-        let vertex_input_state = vk::PipelineVertexInputStateCreateInfo::default();
+        let vert_input_state = vk::PipelineVertexInputStateCreateInfo::default();
         let input_assembly_state = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
         let viewports = [vk::Viewport {
@@ -315,7 +320,7 @@ impl Vk {
         };
         let pipeline_create_infos = [vk::GraphicsPipelineCreateInfo::default()
             .stages(&stages)
-            .vertex_input_state(&vertex_input_state)
+            .vertex_input_state(&vert_input_state)
             .input_assembly_state(&input_assembly_state)
             .viewport_state(&viewport_state)
             .multisample_state(&multisample_state)
@@ -331,67 +336,10 @@ impl Vk {
 
         self.pipeline = Some(pipeline);
         self.pipeline_layout = Some(pipeline_layout);
-        self.vertex_module = Some(vertex_module);
+        self.vert_module = Some(vert_module);
         self.frag_module = Some(frag_module);
 
         Ok(())
-    }
-}
-
-struct ShaderModule {
-    module: naga::Module,
-    module_info: naga::valid::ModuleInfo,
-}
-
-impl ShaderModule {
-    fn new(wgsl_code: &str) -> anyhow::Result<Self> {
-        let module = naga::front::wgsl::parse_str(wgsl_code)?;
-        let module_info = naga::valid::Validator::new(
-            naga::valid::ValidationFlags::all(),
-            naga::valid::Capabilities::all(),
-        )
-        .subgroup_stages(naga::valid::ShaderStages::all())
-        .subgroup_operations(naga::valid::SubgroupOperationSet::all())
-        .validate(&module)?;
-
-        Ok(Self {
-            module,
-            module_info,
-        })
-    }
-
-    fn vertex(&self, device: &ash::Device) -> anyhow::Result<vk::ShaderModule> {
-        let code = naga::back::spv::write_vec(
-            &self.module,
-            &self.module_info,
-            &Default::default(),
-            Some(&naga::back::spv::PipelineOptions {
-                shader_stage: naga::ShaderStage::Vertex,
-                entry_point: "vs_main".to_string(),
-            }),
-        )?;
-        let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
-
-        let shader_module = unsafe { device.create_shader_module(&create_info, None)? };
-
-        Ok(shader_module)
-    }
-
-    fn fragment(&self, device: &ash::Device) -> anyhow::Result<vk::ShaderModule> {
-        let code = naga::back::spv::write_vec(
-            &self.module,
-            &self.module_info,
-            &Default::default(),
-            Some(&naga::back::spv::PipelineOptions {
-                shader_stage: naga::ShaderStage::Fragment,
-                entry_point: "fs_main".to_string(),
-            }),
-        )?;
-        let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
-
-        let shader_module = unsafe { device.create_shader_module(&create_info, None)? };
-
-        Ok(shader_module)
     }
 }
 

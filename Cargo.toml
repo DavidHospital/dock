@@ -3,14 +3,24 @@ name = "dock"
 version = "0.1.0"
 edition = "2024"
 
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"
+
 [dependencies]
 anyhow = "1.0.102"
 ash = "0.38.0"
+bytemuck = "1.25.0"
 memmap2 = "0.9.10"
-naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }
 rustix = "1.1.4"
 wayland-backend = { version = "0.3.15", features = ["client_system"] }
 wayland-client = "0.31.14"
-wayland-protocol = "0.2.0"
 wayland-protocols-wlr = { version = "0.3.12", features = ["client"] }
-wayland-scanner = "0.31.10"
+
+[build-dependencies]
+anyhow = "1.0.102"
+bytemuck = "1.25.0"
+naga = { version = "29.0.3", features = ["wgsl-in", "spv-out"] }

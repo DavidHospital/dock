@@ -1,4 +1,3 @@
-mod protocol;
 mod render;
 
 use std::os::fd::{AsRawFd, BorrowedFd};
