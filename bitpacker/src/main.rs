@@ -1,5 +1,7 @@
 use std::{
-    fs, io::{self, Read, Write}, str::FromStr
+    fs,
+    io::{self, Read, Write},
+    str::FromStr,
 };
 
 use clap::Parser;
@@ -79,7 +81,7 @@ fn main() -> anyhow::Result<()> {
 
     for frame in 0..frame_count {
         zip.start_file(format!("{frame:08}.frame"), options)?;
-        zip.write_all(&out_bytes[frame..frame+frame_size])?;
+        zip.write_all(&out_bytes[frame * frame_size..(frame + 1) * frame_size])?;
     }
 
     let buf = zip.finish()?;

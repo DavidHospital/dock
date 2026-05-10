@@ -396,9 +396,11 @@ dependencies = [
  "ash",
  "bytemuck",
  "naga",
+ "thiserror",
  "wayland-backend",
  "wayland-client",
  "wayland-protocols-wlr",
+ "zip",
 ]
 
 [[package]]

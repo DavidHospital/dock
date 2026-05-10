@@ -27,6 +27,7 @@ struct RenderPipeline {
     render_pass: vk::RenderPass,
     vert_module: vk::ShaderModule,
     frag_module: vk::ShaderModule,
+    descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
     framebuffers: Vec<vk::Framebuffer>,
@@ -35,11 +36,21 @@ struct RenderPipeline {
     image_available_sem: vk::Semaphore,
     render_finished_sem: vk::Semaphore,
     in_flight_fence: vk::Fence,
+    staging_buffer: vk::Buffer,
+    staging_buffer_mem: vk::DeviceMemory,
+    descriptor_sets: (vk::DescriptorPool, Vec<vk::DescriptorSet>),
 }
 
 impl Drop for RenderPipeline {
     fn drop(&mut self) {
         unsafe {
+            let _ = self
+                .device
+                .free_descriptor_sets(self.descriptor_sets.0, &self.descriptor_sets.1);
+            self.device
+                .destroy_descriptor_pool(self.descriptor_sets.0, None);
+            self.device.free_memory(self.staging_buffer_mem, None);
+            self.device.destroy_buffer(self.staging_buffer, None);
             let _ = self.device.reset_fences(&[self.in_flight_fence]);
             self.device.destroy_fence(self.in_flight_fence, None);
             self.device
@@ -53,6 +64,9 @@ impl Drop for RenderPipeline {
             self.device.destroy_pipeline(self.pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            for dsl in &self.descriptor_set_layouts {
+                self.device.destroy_descriptor_set_layout(*dsl, None);
+            }
             self.device.destroy_render_pass(self.render_pass, None);
             self.device.destroy_shader_module(self.vert_module, None);
             self.device.destroy_shader_module(self.frag_module, None);
@@ -183,7 +197,7 @@ impl Vk {
                 .present_family
                 .map(|present_family| device.get_device_queue(present_family, 0));
             let device_details =
-                SurfaceKHRDetails::new(&instance_khr, physical_device, wl_surface)?;
+                SurfaceKHRDetails::new(&instance, &instance_khr, physical_device, wl_surface)?;
 
             let device = Arc::new(device);
 
@@ -349,7 +363,20 @@ impl Vk {
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic_state =
             vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        let pipeline_layout_create_info = vk::PipelineLayoutCreateInfo::default();
+
+        let dsl_bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT)];
+        let descriptor_set_layouts = unsafe {
+            vec![self.device.create_descriptor_set_layout(
+                &vk::DescriptorSetLayoutCreateInfo::default().bindings(&dsl_bindings),
+                None,
+            )?]
+        };
+        let pipeline_layout_create_info =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_set_layouts);
         let pipeline_layout = unsafe {
             self.device
                 .create_pipeline_layout(&pipeline_layout_create_info, None)?
@@ -372,7 +399,7 @@ impl Vk {
                 .map_err(|e| e.1)?[0]
         };
 
-        let mut frame_buffers = Vec::with_capacity(image_views.len());
+        let mut framebuffers = Vec::with_capacity(image_views.len());
         for image_view in &image_views {
             let attachments = [*image_view];
             let frame_buffer_create_info = vk::FramebufferCreateInfo::default()
@@ -382,7 +409,7 @@ impl Vk {
                 .height(extent.height)
                 .layers(1);
 
-            frame_buffers.push(unsafe {
+            framebuffers.push(unsafe {
                 self.device
                     .create_framebuffer(&frame_buffer_create_info, None)?
             });
@@ -422,26 +449,93 @@ impl Vk {
             )?
         };
 
+        let buf_size = extent.width * extent.height / 8;
+        let staging_buffer_create_info = vk::BufferCreateInfo::default()
+            .size(buf_size as u64)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER);
+
+        let staging_buffer = unsafe {
+            self.device
+                .create_buffer(&staging_buffer_create_info, None)?
+        };
+
+        let mem_reqs = unsafe { self.device.get_buffer_memory_requirements(staging_buffer) };
+        let memory_type_index = self.device_details.find_memory_index(
+            mem_reqs.memory_type_bits,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        );
+        let staging_buffer_mem = unsafe {
+            self.device.allocate_memory(
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(mem_reqs.size) // use actual required size too
+                    .memory_type_index(memory_type_index),
+                None,
+            )?
+        };
+        unsafe {
+            self.device
+                .bind_buffer_memory(staging_buffer, staging_buffer_mem, 0)?
+        };
+
+        let pool_sizes = [vk::DescriptorPoolSize {
+            ty: vk::DescriptorType::STORAGE_BUFFER,
+            descriptor_count: 1,
+        }];
+        let descriptor_pool = unsafe {
+            self.device.create_descriptor_pool(
+                &vk::DescriptorPoolCreateInfo::default()
+                    .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
+                    .pool_sizes(&pool_sizes)
+                    .max_sets(1),
+                None,
+            )?
+        };
+        let descriptor_sets = unsafe {
+            self.device.allocate_descriptor_sets(
+                &vk::DescriptorSetAllocateInfo::default()
+                    .descriptor_pool(descriptor_pool)
+                    .set_layouts(&descriptor_set_layouts),
+            )?
+        };
+
+        let descriptor_buffer_info = [vk::DescriptorBufferInfo::default()
+            .buffer(staging_buffer)
+            .offset(0)
+            .range(vk::WHOLE_SIZE)];
+
+        let descriptor_writes = [vk::WriteDescriptorSet::default()
+            .dst_set(descriptor_sets[0])
+            .dst_binding(0)
+            .dst_array_element(0)
+            .descriptor_type(vk::DescriptorType::STORAGE_BUFFER)
+            .buffer_info(&descriptor_buffer_info)];
+
+        unsafe { self.device.update_descriptor_sets(&descriptor_writes, &[]) };
+
         self.render_pipeline = Some(RenderPipeline {
             device: self.device.clone(),
             swap_chain: (sc_device, swap_chain, image_views, extent),
-            vert_module: vert_module,
-            frag_module: frag_module,
-            pipeline_layout: pipeline_layout,
-            pipeline: pipeline,
-            framebuffers: frame_buffers,
-            command_pool: command_pool,
-            command_buffers: command_buffers,
+            vert_module,
+            frag_module,
+            descriptor_set_layouts,
+            pipeline_layout,
+            pipeline,
+            framebuffers,
+            command_pool,
+            command_buffers,
             render_pass,
             image_available_sem,
             render_finished_sem,
             in_flight_fence,
+            staging_buffer,
+            staging_buffer_mem,
+            descriptor_sets: (descriptor_pool, descriptor_sets),
         });
 
         Ok(())
     }
 
-    pub fn draw_frame(&self) -> anyhow::Result<()> {
+    pub fn draw_frame(&self, frame_data: &[u8]) -> anyhow::Result<()> {
         let Some(rp) = self.render_pipeline.as_ref() else {
             anyhow::bail!("Render pipeline not configured");
         };
@@ -464,7 +558,11 @@ impl Vk {
                 rp.command_buffers[0],
                 vk::CommandBufferResetFlags::empty(),
             )?;
-            self.record_command_buffer(0, image_index as usize)?;
+            self.record_command_buffer(
+                0,
+                image_index as usize,
+                frame_data.as_ptr() as *const c_void,
+            )?;
 
             let wait_semaphores = [rp.image_available_sem];
             let signal_semaphores = [rp.render_finished_sem];
@@ -499,12 +597,15 @@ impl Vk {
         &self,
         command_buffer_index: usize,
         image_index: usize,
+        frame_data: *const c_void,
     ) -> VkResult<()> {
         let Some(render_pipeline) = &self.render_pipeline else {
             return Ok(());
         };
 
         let command_buffer = render_pipeline.command_buffers[command_buffer_index];
+        let extent = render_pipeline.swap_chain.3;
+        let buf_size = extent.width * extent.height / 8;
 
         let begin_info = vk::CommandBufferBeginInfo::default();
         unsafe {
@@ -523,11 +624,20 @@ impl Vk {
             .render_area(
                 vk::Rect2D::default()
                     .offset(vk::Offset2D { x: 0, y: 0 })
-                    .extent(render_pipeline.swap_chain.3),
+                    .extent(extent),
             )
             .clear_values(&clear_values);
 
         unsafe {
+            let buf = self.device.map_memory(
+                render_pipeline.staging_buffer_mem,
+                0,
+                buf_size as u64,
+                vk::MemoryMapFlags::empty(),
+            )?;
+            std::ptr::copy_nonoverlapping(frame_data, buf, buf_size as usize);
+            self.device.unmap_memory(render_pipeline.staging_buffer_mem);
+
             self.device.cmd_begin_render_pass(
                 command_buffer,
                 &render_pass_info,
@@ -552,6 +662,14 @@ impl Vk {
                 extent: render_pipeline.swap_chain.3,
             }];
             self.device.cmd_set_scissor(command_buffer, 0, &scissors);
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                render_pipeline.pipeline_layout,
+                0,
+                &render_pipeline.descriptor_sets.1,
+                &[],
+            );
             self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
             self.device.cmd_end_render_pass(command_buffer);
             self.device.end_command_buffer(command_buffer)?;
@@ -670,10 +788,12 @@ struct SurfaceKHRDetails {
     surface_caps: vk::SurfaceCapabilitiesKHR,
     surface_formats: Vec<vk::SurfaceFormatKHR>,
     present_modes: Vec<vk::PresentModeKHR>,
+    mem_props: vk::PhysicalDeviceMemoryProperties,
 }
 
 impl SurfaceKHRDetails {
     fn new(
+        instance: &Instance,
         instance_khr: &surface::Instance,
         device: vk::PhysicalDevice,
         surface: vk::SurfaceKHR,
@@ -686,10 +806,13 @@ impl SurfaceKHRDetails {
             let present_modes =
                 instance_khr.get_physical_device_surface_present_modes(device, surface)?;
 
+            let mem_props = instance.get_physical_device_memory_properties(device);
+
             Ok(Self {
                 surface_caps,
                 surface_formats,
                 present_modes,
+                mem_props,
             })
         }
     }
@@ -729,6 +852,19 @@ impl SurfaceKHRDetails {
             return flag;
         }
         return vk::CompositeAlphaFlagsKHR::OPAQUE;
+    }
+
+    fn find_memory_index(&self, type_filter: u32, flags: vk::MemoryPropertyFlags) -> u32 {
+        for i in 0..self.mem_props.memory_type_count {
+            let type_matches = type_filter & (1 << i) != 0;
+            let flags_match = self.mem_props.memory_types[i as usize]
+                .property_flags
+                .contains(flags);
+            if type_matches && flags_match {
+                return i;
+            }
+        }
+        panic!("no suitable memory type found");
     }
 }
 

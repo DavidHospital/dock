@@ -1,3 +1,4 @@
+mod bitunpacker;
 mod render;
 
 use wayland_client::Dispatch;
@@ -14,15 +15,18 @@ use wayland_protocols_wlr::layer_shell::v1::client::{
     zwlr_layer_surface_v1::{self, Anchor, ZwlrLayerSurfaceV1},
 };
 
+use crate::bitunpacker::BMask;
 use crate::render::Vk;
 
 struct State {
     surface: WlSurface,
     ctx: Vk,
+    b_mask: BMask,
+    frame_count: u64,
 }
 
 impl State {
-    fn new(display: &WlDisplay, globals: Globals, qh: &QueueHandle<Self>) -> Self {
+    fn new(display: &WlDisplay, globals: Globals, qh: &QueueHandle<Self>, b_mask: BMask) -> Self {
         let surface = globals.compositor.create_surface(qh, ());
         let layer_surface = globals.layer_shell.get_layer_surface(
             &surface,
@@ -39,7 +43,12 @@ impl State {
 
         let ctx = Vk::new(display, &surface).unwrap();
 
-        Self { surface, ctx }
+        Self {
+            surface,
+            ctx,
+            b_mask,
+            frame_count: 0,
+        }
     }
 }
 
@@ -120,7 +129,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
                 proxy.ack_configure(serial);
 
                 state.ctx.init_pipeline(width, height).unwrap();
-                state.ctx.draw_frame().unwrap();
+                state.ctx.draw_frame(&state.b_mask.sample(0)).unwrap();
 
                 state.surface.frame(qhandle, ());
             }
@@ -139,7 +148,11 @@ impl Dispatch<wl_callback::WlCallback, ()> for State {
         qhandle: &QueueHandle<Self>,
     ) {
         if let wl_callback::Event::Done { callback_data: _ } = event {
-            state.ctx.draw_frame().unwrap();
+            state.frame_count = state.frame_count.wrapping_add(1);
+            state
+                .ctx
+                .draw_frame(&state.b_mask.sample(state.frame_count))
+                .unwrap();
 
             state.surface.frame(qhandle, ());
             state.surface.commit();
@@ -156,6 +169,8 @@ delegate_noop!(State: ignore WlShmPool);
 delegate_noop!(State: ignore WlBuffer);
 
 fn main() -> anyhow::Result<()> {
+    let b_mask = BMask::new(&"birds.bmsk.zip")?;
+
     let connection = Connection::connect_to_env()?;
 
     let display = connection.display();
@@ -184,7 +199,7 @@ fn main() -> anyhow::Result<()> {
     let mut event_queue = connection.new_event_queue::<State>();
     let qh = event_queue.handle();
 
-    let mut state = State::new(&display, globals, &qh);
+    let mut state = State::new(&display, globals, &qh, b_mask);
 
     while event_queue.blocking_dispatch(&mut state).is_ok() {}
 
