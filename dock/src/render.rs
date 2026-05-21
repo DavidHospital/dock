@@ -9,14 +9,77 @@ use ash::{
     ext::debug_utils,
     khr::{surface, swapchain, wayland_surface},
     prelude::VkResult,
-    vk::{self},
+    vk::{self, CommandBuffer},
 };
 use wayland_client::{
     Proxy,
     protocol::{wl_display::WlDisplay, wl_surface::WlSurface},
 };
 
+struct DescriptorSets {
+    pool: vk::DescriptorPool,
+    sets: Vec<vk::DescriptorSet>,
+}
+
+impl DescriptorSets {
+    fn slice(&self) -> &[vk::DescriptorSet] {
+        &self.sets
+    }
+
+    unsafe fn cleanup(&mut self, device: &ash::Device) {
+        unsafe {
+            let _ = device
+                .free_descriptor_sets(self.pool, &self.sets)
+                .inspect_err(|e| eprintln!("Error freeing descriptor set: {e}"));
+            device.destroy_descriptor_pool(self.pool, None);
+        }
+    }
+}
+
 struct RenderPipeline {
+    device: Arc<ash::Device>,
+    vert_module: vk::ShaderModule,
+    frag_module: vk::ShaderModule,
+    descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+}
+
+impl RenderPipeline {
+    fn cleanup(&mut self) {
+        unsafe {
+            self.device.destroy_pipeline(self.pipeline, None);
+            self.device
+                .destroy_pipeline_layout(self.pipeline_layout, None);
+            for dsl in &self.descriptor_set_layouts {
+                self.device.destroy_descriptor_set_layout(*dsl, None);
+            }
+            self.device.destroy_shader_module(self.frag_module, None);
+            self.device.destroy_shader_module(self.vert_module, None);
+        }
+    }
+
+    unsafe fn render_pass(&self, command_buffer: CommandBuffer, descriptor_sets: &DescriptorSets) {
+        unsafe {
+            self.device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline,
+            );
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &descriptor_sets.slice(),
+                &[],
+            );
+            self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        }
+    }
+}
+
+struct RenderContext {
     device: Arc<ash::Device>,
     swap_chain: (
         swapchain::Device,
@@ -25,32 +88,24 @@ struct RenderPipeline {
         vk::Extent2D,
     ),
     render_pass: vk::RenderPass,
-    vert_module: vk::ShaderModule,
-    frag_module: vk::ShaderModule,
-    descriptor_set_layouts: Vec<vk::DescriptorSetLayout>,
-    pipeline_layout: vk::PipelineLayout,
-    pipeline: vk::Pipeline,
+    background_pipeline: RenderPipeline,
     framebuffers: Vec<vk::Framebuffer>,
     command_pool: vk::CommandPool,
     command_buffers: Vec<vk::CommandBuffer>,
     image_available_sem: vk::Semaphore,
     render_finished_sem: vk::Semaphore,
     in_flight_fence: vk::Fence,
-    staging_buffer: vk::Buffer,
-    staging_buffer_mem: vk::DeviceMemory,
-    descriptor_sets: (vk::DescriptorPool, Vec<vk::DescriptorSet>),
+    dock_buffer: vk::Buffer,
+    dock_buffer_mem: vk::DeviceMemory,
+    background_ds: DescriptorSets,
 }
 
-impl Drop for RenderPipeline {
-    fn drop(&mut self) {
+impl RenderContext {
+    fn cleanup(&mut self) {
         unsafe {
-            let _ = self
-                .device
-                .free_descriptor_sets(self.descriptor_sets.0, &self.descriptor_sets.1);
-            self.device
-                .destroy_descriptor_pool(self.descriptor_sets.0, None);
-            self.device.free_memory(self.staging_buffer_mem, None);
-            self.device.destroy_buffer(self.staging_buffer, None);
+            self.background_ds.cleanup(&self.device);
+            self.device.free_memory(self.dock_buffer_mem, None);
+            self.device.destroy_buffer(self.dock_buffer, None);
             let _ = self.device.reset_fences(&[self.in_flight_fence]);
             self.device.destroy_fence(self.in_flight_fence, None);
             self.device
@@ -61,15 +116,7 @@ impl Drop for RenderPipeline {
             for framebuffer in &self.framebuffers {
                 self.device.destroy_framebuffer(*framebuffer, None);
             }
-            self.device.destroy_pipeline(self.pipeline, None);
-            self.device
-                .destroy_pipeline_layout(self.pipeline_layout, None);
-            for dsl in &self.descriptor_set_layouts {
-                self.device.destroy_descriptor_set_layout(*dsl, None);
-            }
-            self.device.destroy_render_pass(self.render_pass, None);
-            self.device.destroy_shader_module(self.vert_module, None);
-            self.device.destroy_shader_module(self.frag_module, None);
+            self.background_pipeline.cleanup();
             for image_view in &self.swap_chain.2 {
                 self.device.destroy_image_view(*image_view, None);
             }
@@ -93,13 +140,13 @@ pub struct Vk {
     present_queue: Option<vk::Queue>,
     queue_families: QueueFamilies,
     device_details: SurfaceKHRDetails,
-    render_pipeline: Option<RenderPipeline>,
+    render_context: Option<RenderContext>,
 }
 
 impl Drop for Vk {
     fn drop(&mut self) {
-        if let Some(render_pipeline) = self.render_pipeline.take() {
-            drop(render_pipeline);
+        if let Some(mut render_context) = self.render_context.take() {
+            render_context.cleanup();
         }
         unsafe {
             self.device.destroy_device(None);
@@ -215,18 +262,18 @@ impl Vk {
                 present_queue,
                 queue_families,
                 device_details,
-                render_pipeline: None,
+                render_context: None,
             })
         }
     }
 
     pub fn init_pipeline(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
-        if let Some(render_pipeline) = self.render_pipeline.take() {
+        if let Some(mut render_context) = self.render_context.take() {
             unsafe {
                 self.device.device_wait_idle()?;
             }
 
-            drop(render_pipeline);
+            render_context.cleanup();
         }
 
         let surface_format = self.device_details.choose_surface_format()?;
@@ -450,21 +497,18 @@ impl Vk {
         };
 
         let buf_size = extent.width * extent.height / 8;
-        let staging_buffer_create_info = vk::BufferCreateInfo::default()
+        let dock_buffer_create_info = vk::BufferCreateInfo::default()
             .size(buf_size as u64)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER);
 
-        let staging_buffer = unsafe {
-            self.device
-                .create_buffer(&staging_buffer_create_info, None)?
-        };
+        let dock_buffer = unsafe { self.device.create_buffer(&dock_buffer_create_info, None)? };
 
-        let mem_reqs = unsafe { self.device.get_buffer_memory_requirements(staging_buffer) };
+        let mem_reqs = unsafe { self.device.get_buffer_memory_requirements(dock_buffer) };
         let memory_type_index = self.device_details.find_memory_index(
             mem_reqs.memory_type_bits,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::DEVICE_LOCAL,
         );
-        let staging_buffer_mem = unsafe {
+        let dock_buffer_mem = unsafe {
             self.device.allocate_memory(
                 &vk::MemoryAllocateInfo::default()
                     .allocation_size(mem_reqs.size) // use actual required size too
@@ -474,7 +518,7 @@ impl Vk {
         };
         unsafe {
             self.device
-                .bind_buffer_memory(staging_buffer, staging_buffer_mem, 0)?
+                .bind_buffer_memory(dock_buffer, dock_buffer_mem, 0)?
         };
 
         let pool_sizes = [vk::DescriptorPoolSize {
@@ -499,7 +543,7 @@ impl Vk {
         };
 
         let descriptor_buffer_info = [vk::DescriptorBufferInfo::default()
-            .buffer(staging_buffer)
+            .buffer(dock_buffer)
             .offset(0)
             .range(vk::WHOLE_SIZE)];
 
@@ -512,14 +556,24 @@ impl Vk {
 
         unsafe { self.device.update_descriptor_sets(&descriptor_writes, &[]) };
 
-        self.render_pipeline = Some(RenderPipeline {
+        let background_pipeline = RenderPipeline {
             device: self.device.clone(),
-            swap_chain: (sc_device, swap_chain, image_views, extent),
             vert_module,
             frag_module,
             descriptor_set_layouts,
             pipeline_layout,
             pipeline,
+        };
+
+        let background_ds = DescriptorSets {
+            pool: descriptor_pool,
+            sets: descriptor_sets,
+        };
+
+        self.render_context = Some(RenderContext {
+            device: self.device.clone(),
+            swap_chain: (sc_device, swap_chain, image_views, extent),
+            background_pipeline,
             framebuffers,
             command_pool,
             command_buffers,
@@ -527,53 +581,53 @@ impl Vk {
             image_available_sem,
             render_finished_sem,
             in_flight_fence,
-            staging_buffer,
-            staging_buffer_mem,
-            descriptor_sets: (descriptor_pool, descriptor_sets),
+            dock_buffer,
+            dock_buffer_mem,
+            background_ds,
         });
 
         Ok(())
     }
 
-    pub fn draw_frame(&self, frame_data: &[u8]) -> anyhow::Result<()> {
-        let Some(rp) = self.render_pipeline.as_ref() else {
+    pub fn draw_frame(&self, backgroud_data: &[u8]) -> anyhow::Result<()> {
+        let Some(ctx) = self.render_context.as_ref() else {
             anyhow::bail!("Render pipeline not configured");
         };
 
-        let (sc_device, swap_chain, _, _) = &rp.swap_chain;
+        let (sc_device, swap_chain, _, _) = &ctx.swap_chain;
 
         unsafe {
             self.device
-                .wait_for_fences(&[rp.in_flight_fence], true, u64::MAX)?;
-            self.device.reset_fences(&[rp.in_flight_fence])?;
+                .wait_for_fences(&[ctx.in_flight_fence], true, u64::MAX)?;
+            self.device.reset_fences(&[ctx.in_flight_fence])?;
 
             let (image_index, _) = sc_device.acquire_next_image(
                 *swap_chain,
                 u64::MAX,
-                rp.image_available_sem,
+                ctx.image_available_sem,
                 vk::Fence::null(),
             )?;
 
             self.device.reset_command_buffer(
-                rp.command_buffers[0],
+                ctx.command_buffers[0],
                 vk::CommandBufferResetFlags::empty(),
             )?;
             self.record_command_buffer(
                 0,
                 image_index as usize,
-                frame_data.as_ptr() as *const c_void,
+                backgroud_data.as_ptr() as *const c_void,
             )?;
 
-            let wait_semaphores = [rp.image_available_sem];
-            let signal_semaphores = [rp.render_finished_sem];
+            let wait_semaphores = [ctx.image_available_sem];
+            let signal_semaphores = [ctx.render_finished_sem];
             let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
             let submit_info = vk::SubmitInfo::default()
                 .wait_semaphores(&wait_semaphores)
                 .wait_dst_stage_mask(&wait_stages)
-                .command_buffers(&rp.command_buffers[..1])
+                .command_buffers(&ctx.command_buffers[..1])
                 .signal_semaphores(&signal_semaphores);
             self.device
-                .queue_submit(self.graphics_queue, &[submit_info], rp.in_flight_fence)?;
+                .queue_submit(self.graphics_queue, &[submit_info], ctx.in_flight_fence)?;
 
             let swapchains = [*swap_chain];
             let image_indices = [image_index];
@@ -597,14 +651,14 @@ impl Vk {
         &self,
         command_buffer_index: usize,
         image_index: usize,
-        frame_data: *const c_void,
+        backgroud_data: *const c_void,
     ) -> VkResult<()> {
-        let Some(render_pipeline) = &self.render_pipeline else {
+        let Some(ctx) = &self.render_context else {
             return Ok(());
         };
 
-        let command_buffer = render_pipeline.command_buffers[command_buffer_index];
-        let extent = render_pipeline.swap_chain.3;
+        let command_buffer = ctx.command_buffers[command_buffer_index];
+        let extent = ctx.swap_chain.3;
         let buf_size = extent.width * extent.height / 8;
 
         let begin_info = vk::CommandBufferBeginInfo::default();
@@ -619,8 +673,8 @@ impl Vk {
             },
         }];
         let render_pass_info = vk::RenderPassBeginInfo::default()
-            .render_pass(render_pipeline.render_pass)
-            .framebuffer(render_pipeline.framebuffers[image_index])
+            .render_pass(ctx.render_pass)
+            .framebuffer(ctx.framebuffers[image_index])
             .render_area(
                 vk::Rect2D::default()
                     .offset(vk::Offset2D { x: 0, y: 0 })
@@ -630,47 +684,35 @@ impl Vk {
 
         unsafe {
             let buf = self.device.map_memory(
-                render_pipeline.staging_buffer_mem,
+                ctx.dock_buffer_mem,
                 0,
                 buf_size as u64,
                 vk::MemoryMapFlags::empty(),
             )?;
-            std::ptr::copy_nonoverlapping(frame_data, buf, buf_size as usize);
-            self.device.unmap_memory(render_pipeline.staging_buffer_mem);
+            std::ptr::copy_nonoverlapping(backgroud_data, buf, buf_size as usize);
+            self.device.unmap_memory(ctx.dock_buffer_mem);
 
             self.device.cmd_begin_render_pass(
                 command_buffer,
                 &render_pass_info,
                 vk::SubpassContents::INLINE,
             );
-            self.device.cmd_bind_pipeline(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                render_pipeline.pipeline,
-            );
             let viewports = [vk::Viewport {
                 x: 0.0,
                 y: 0.0,
-                width: render_pipeline.swap_chain.3.width as f32,
-                height: render_pipeline.swap_chain.3.height as f32,
+                width: ctx.swap_chain.3.width as f32,
+                height: ctx.swap_chain.3.height as f32,
                 min_depth: 0.0,
                 max_depth: 1.0,
             }];
             self.device.cmd_set_viewport(command_buffer, 0, &viewports);
             let scissors = [vk::Rect2D {
                 offset: vk::Offset2D { x: 0, y: 0 },
-                extent: render_pipeline.swap_chain.3,
+                extent: ctx.swap_chain.3,
             }];
             self.device.cmd_set_scissor(command_buffer, 0, &scissors);
-            self.device.cmd_bind_descriptor_sets(
-                command_buffer,
-                vk::PipelineBindPoint::GRAPHICS,
-                render_pipeline.pipeline_layout,
-                0,
-                &render_pipeline.descriptor_sets.1,
-                &[],
-            );
-            self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            ctx.background_pipeline
+                .render_pass(command_buffer, &ctx.background_ds);
             self.device.cmd_end_render_pass(command_buffer);
             self.device.end_command_buffer(command_buffer)?;
         }
