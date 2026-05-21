@@ -128,7 +128,7 @@ impl Dispatch<ZwlrLayerSurfaceV1, ()> for State {
             } => {
                 proxy.ack_configure(serial);
 
-                state.ctx.init_pipeline(width, height).unwrap();
+                state.ctx.init_pipelines(width, height).unwrap();
                 state.ctx.draw_frame(&state.b_mask.sample(0)).unwrap();
 
                 state.surface.frame(qhandle, ());

@@ -267,7 +267,7 @@ impl Vk {
         }
     }
 
-    pub fn init_pipeline(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
+    pub fn init_pipelines(&mut self, width: u32, height: u32) -> anyhow::Result<()> {
         if let Some(mut render_context) = self.render_context.take() {
             unsafe {
                 self.device.device_wait_idle()?;
